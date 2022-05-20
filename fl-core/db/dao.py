@@ -8,6 +8,7 @@ class EvaluationMetric(Enum):
     PRECISION = 2
     F1_SCORE = 3
     RECALL = 4
+    SHAPLEY_VALUE = 5
 
 
 class Organization(Document):
@@ -23,6 +24,7 @@ class FLConfig(Document):
     log_interval = IntField()
     epochs = IntField()
     participation_fee = FloatField()
+    minimum_contribution_value = IntField()
     created_at = DateTimeField(default=datetime.now())
 
     @queryset_manager

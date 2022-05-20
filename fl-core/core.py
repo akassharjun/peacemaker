@@ -1,5 +1,6 @@
 import copy
 import functools
+import itertools
 import logging
 import os
 import sys
@@ -9,12 +10,10 @@ import time
 import pika
 import syft as sy
 import torch
-import torch.nn.functional as F
 from modelstore import ModelStore
-from pika.exchange_type import ExchangeType
 from sklearn.metrics import precision_score, f1_score, recall_score, accuracy_score
 from syft.frameworks.torch.fl import utils
-from torch import optim
+from torch import optim, nn
 from torchvision import datasets
 from torchvision.transforms import transforms
 from tqdm import tqdm
@@ -22,9 +21,9 @@ from tqdm import tqdm
 from db.database_manager import *
 from model import Net
 
-args = get_fl_config()
 logging.basicConfig(format='%(asctime)s - %(message)s', level=logging.INFO)
 
+args = get_fl_config()
 device = torch.device("cuda" if args.use_cuda else "cpu")
 
 
@@ -36,6 +35,9 @@ def generate_virtual_workers(orgs):
     # create a virtual worker for each organisation
     logging.info("Setting up virtual workers")
     for org in tqdm(orgs):
+        if org.name == "Org E":
+            continue
+
         worker_list.append(sy.VirtualWorker(hook, id=f"{org.name}"))
 
     return worker_list
@@ -111,31 +113,31 @@ def load_dataset(virtual_workers):
                            transforms.ToTensor(),
                            transforms.Normalize((0.1307,), (0.3081,))
                        ])).federate(tuple(virtual_workers)),
-        batch_size=args['batch_size'], shuffle=True)
+        batch_size=args.batch_size, shuffle=True)
 
     test_loader = torch.utils.data.DataLoader(
         datasets.MNIST('../data', train=False, transform=transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize((0.1307,), (0.3081,))
         ])),
-        batch_size=args['test_batch_size'], shuffle=True)
+        batch_size=args.test_batch_size, shuffle=True)
 
     return federated_train_loader, test_loader
 
 
-def local_step(data, target, local_model, local_optimizer):
+def local_step(data, target, local_model, local_optimizer, local_criterion):
     local_model.train()
 
     local_model.send(data.location)
 
-    if data.location.id == 'Org A':
+    if data.location.id == 'Org A' or data.location.id == 'Org B':
         data = torch.flip(data, [0, 1])
 
     local_optimizer.zero_grad()
 
     output = local_model(data)
 
-    loss = F.nll_loss(output, target)
+    loss = local_criterion(output, target)
 
     loss.backward()
 
@@ -144,7 +146,7 @@ def local_step(data, target, local_model, local_optimizer):
     return local_model.get(), loss
 
 
-def train(epoch, worker_dataloader, models, optimizers):
+def train(epoch, worker_dataloader, models, optimizers, criterions):
     for batch_idx, (data, target) in enumerate(worker_dataloader):
 
         org = data.location.id
@@ -154,13 +156,14 @@ def train(epoch, worker_dataloader, models, optimizers):
         # get the organisation's model
         model = models[org]
         optimizer = optimizers[org]
+        criterion = criterions[org]
 
-        model_update, loss = local_step(data, target, model, optimizer)
+        model_update, loss = local_step(data, target, model, optimizer, criterion)
 
         # get back the updated model
         models[org] = model_update
 
-        if batch_idx % args.log_interval == 0:
+        if batch_idx % 10 == 0:
             loss = loss.get()
 
             print('Virtual Worker: {} Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
@@ -172,11 +175,10 @@ def train(epoch, worker_dataloader, models, optimizers):
     return models
 
 
-def measure_contribution(models, evaluation_dataloader):
+def calculate_test_based_evaluation(models, evaluation_dataloader):
     logging.info("Measuring Contribution")
     contribution_evaluation = {}
-    # for the i-th epoch, get the contribution measure of each organisation
-    # and store it to calculate the payout ratio.
+
     for org, model in tqdm(models.items()):
         contribution_measure = evaluate_contribution_measure(model, evaluation_dataloader)
 
@@ -188,34 +190,43 @@ def measure_contribution(models, evaluation_dataloader):
 def distribute_global_model(virtual_workers, global_model):
     worker_models = {}
     worker_optimizers = {}
+    worker_criterions = {}
 
     logging.info("Distributing Global Model")
     for virtual_worker in tqdm(virtual_workers):
         model = copy.deepcopy(global_model)
         worker_models[virtual_worker.id] = model
         worker_optimizers[virtual_worker.id] = optim.SGD(model.parameters(), lr=args.learning_rate)
+        worker_criterions[virtual_worker.id] = nn.CrossEntropyLoss()
 
-    return worker_models, worker_optimizers
+    return worker_models, worker_optimizers, worker_criterions
 
 
 def distribute_payout(contribution_evaluation, budget):
     logging.info("Distributing Payout")
 
     payout_result = {}
-    aggr_contribution = sum(contribution_evaluation.values())
+    aggr_contribution = 0
+
+    for org, contribution in contribution_evaluation.items():
+        if contribution >= args.minimum_contribution_value / 100:
+            aggr_contribution += contribution
 
     for org, contribution in tqdm(contribution_evaluation.items()):
-        payout = contribution / aggr_contribution * budget
+        payout = 0
+
+        if contribution >= args.minimum_contribution_value / 100:
+            payout = contribution / aggr_contribution * budget
 
         payout_result[org] = {'payout': payout, 'contribution_measure': contribution}
 
     return payout_result
 
 
-def collect_participation_fee(virtual_workers):
+def collect_participation_fee(organizations):
     logging.info("Collecting Participation Fee")
     fees = 0
-    for _ in tqdm(virtual_workers):
+    for _ in tqdm(organizations):
         fees += args.participation_fee
     return fees
 
@@ -242,10 +253,53 @@ def fed_avg(models):
     return utils.federated_avg(models)
 
 
+def calculate_shapley_value(models, evaluation_dataloader):
+    # generate possible permutations
+    all_perms = list(itertools.permutations(list(models.keys())))
+    marginal_contributions = []
+    # history map to avoid retesting the models
+    history = {}
+
+    for perm in all_perms:
+        perm_values = {}
+        local_models = {}
+
+        for client_id in perm:
+            model = copy.deepcopy(models[client_id])
+            local_models[client_id] = model
+
+            # get the current index eg: (A,B,C) on the 2nd iter, the index is (A,B)
+            if len(perm_values.keys()) == 0:
+                index = (client_id,)
+            else:
+                index = tuple(sorted(list(tuple(perm_values.keys()) + (client_id,))))
+
+            if index in history.keys():
+                current_value = history[index]
+            else:
+                current_value = evaluate_contribution_measure(model, evaluation_dataloader)
+                history[index] = current_value
+
+            perm_values[client_id] = max(0, current_value - sum(perm_values.values()))
+
+        marginal_contributions.append(perm_values)
+
+    sv = {client_id: 0 for client_id in models.keys()}
+
+    # sum the marginal contributions
+    for perm in marginal_contributions:
+        for key, value in perm.items():
+            sv[key] += value
+
+    # compute the average marginal contribution
+    sv = {key: value / len(marginal_contributions) for key, value in sv.items()}
+
+    return sv
+
+
 def initiate_training():
     logging.info("Retrieving Global Model")
     db_global_model = get_global_model()
-    global_model = None
 
     if db_global_model is not None:
         logging.info("Loaded Global Model")
@@ -263,27 +317,32 @@ def initiate_training():
 
     virtual_workers = generate_virtual_workers(organizations)
 
+    # load the experiment dataset to the virtual workers
     worker_dataset_loader, evaluation_dataset = load_dataset(virtual_workers)
 
-    budget = collect_participation_fee(virtual_workers)
+    budget = collect_participation_fee(organizations)
 
-    worker_models, worker_optimizers = distribute_global_model(virtual_workers, global_model)
+    worker_models, worker_optimizers, worker_criterions = distribute_global_model(virtual_workers, global_model)
 
     communication_time = {}
 
     for epoch in range(1, args.epochs + 1):
         start_time = time.time()
         worker_models = train(epoch, worker_dataset_loader, worker_models,
-                              worker_optimizers)
+                              worker_optimizers, worker_criterions)
         total_time = time.time() - start_time
         communication_time[epoch] = round(total_time, 2)
 
-    contribution_evaluation = measure_contribution(worker_models, evaluation_dataset)
+    if args.evaluation_metric == EvaluationMetric.SHAPLEY_VALUE:
+        contribution_evaluation = calculate_shapley_value(worker_models, evaluation_dataset)
+    else:
+        contribution_evaluation = calculate_test_based_evaluation(worker_models, evaluation_dataset)
 
     payout_result = distribute_payout(contribution_evaluation, budget)
 
     federated_model = fed_avg(worker_models)
 
+    # generate global model report
     model_report = test_global_model(federated_model, evaluation_dataset)
 
     training_round = update_training_round(training_round_id, budget, payout_result, communication_time)
@@ -291,25 +350,22 @@ def initiate_training():
     store_global_model(federated_model, model_report, training_round)
 
 
-def peacemaker(ch, method, properties, body):
-    pass
-
 def ack_message(ch, delivery_tag):
-    """Note that `ch` must be the same pika channel instance via which
-    the message being ACKed was retrieved (AMQP protocol constraint).
-    """
+    # Channel is open,this message
     if ch.is_open:
         ch.basic_ack(delivery_tag)
     else:
-        # Channel is already closed, so we can't ACK this message;
-        # log and/or do something that makes sense for your app in this case.
+        # Channel is already closed, so we can't ACK this message
         pass
 
-def do_work(ch, delivery_tag, body):
+
+# callback for when the peacemaker queue receives a message
+def fl_training_callback(ch, delivery_tag, body):
     thread_id = threading.get_ident()
-    logging.info('Thread id: %s Delivery tag: %s Message body: %s', thread_id,
-                delivery_tag, body)
-    # Sleeping to simulate 10 seconds of work
+    logging.info('Training Job', thread_id,
+                 delivery_tag, body)
+
+    # entry point to FL system
     logging.info("[x] Starting training job")
     initiate_training()
 
@@ -318,17 +374,20 @@ def do_work(ch, delivery_tag, body):
 
 
 def on_message(ch, method_frame, _header_frame, body, args):
-    thrds = args
+    # when a message is inserted into the queue, create a thread to
+    # run the necessary function for it.
+    th = args
     delivery_tag = method_frame.delivery_tag
-    t = threading.Thread(target=do_work, args=(ch, delivery_tag, body))
+    t = threading.Thread(target=fl_training_callback, args=(ch, delivery_tag, body))
     t.start()
-    thrds.append(t)
+    th.append(t)
+
 
 if __name__ == '__main__':
+    # Pika setup for using rabbitmq for subscribing to a queue for training job requests
     try:
         credentials = pika.PlainCredentials('guest', 'guest')
-        # Note: sending a short heartbeat to prove that heartbeats are still
-        # sent even though the worker simulates long-running work
+
         parameters = pika.ConnectionParameters(
             'localhost', credentials=credentials, heartbeat=5)
         connection = pika.BlockingConnection(parameters)
@@ -346,13 +405,11 @@ if __name__ == '__main__':
 
         channel.queue_bind(
             queue="peacemaker", exchange="peacemaker_exchange", routing_key="peacemaker_key")
-        # Note: prefetch is set to 1 here as an example only and to keep the number of threads created
-        # to a reasonable amount. In production you will want to test with different prefetch values
-        # to find which one provides the best performance and usability for your solution
+
         channel.basic_qos(prefetch_count=1)
 
         threads = []
-        on_message_callback = functools.partial(on_message, args=(threads))
+        on_message_callback = functools.partial(on_message, args=threads)
         channel.basic_consume('peacemaker', on_message_callback)
 
         logging.info('[*] Waiting for training job requests.')
